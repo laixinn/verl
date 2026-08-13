@@ -340,3 +340,23 @@ class RolloutConfig(BaseConfig):
             raise ValueError(
                 f"rollout.disaggregation.enabled=True requires rollout.name in ('sglang', 'vllm'); got {self.name!r}."
             )
+
+        if self.disaggregation.enabled and self.name == "sglang":
+            # Hybrid PD invariants (see docs/advance/sglang_hybrid_pd_disaggregation.md):
+            # equal prefill/decode TP, DP==1, PP==1. Fail closed instead of silently
+            # truncating or ignoring trainer GPUs.
+            self.disaggregation.validate_equal_pd_tp(self.tensor_model_parallel_size)
+            if self.disaggregation.router.backend != "ray":
+                raise NotImplementedError(
+                    "SGLang hybrid PD currently supports only disaggregation.router.backend='ray'."
+                )
+            if self.data_parallel_size != 1:
+                raise ValueError(
+                    "The hybrid PD implementation requires rollout.data_parallel_size == 1; "
+                    f"got {self.data_parallel_size}."
+                )
+            if self.pipeline_model_parallel_size != 1:
+                raise ValueError(
+                    "The hybrid PD implementation requires rollout.pipeline_model_parallel_size == 1; "
+                    f"got {self.pipeline_model_parallel_size}."
+                )

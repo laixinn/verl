@@ -17,7 +17,6 @@ import dataclasses
 import json
 import logging
 import os
-import secrets
 from pathlib import Path
 from typing import Any, Optional
 
@@ -172,10 +171,6 @@ class SGLangHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
 
-        # PD peer linkage populated post-launch by SGLangPDReplica.set_pd_peer.
-        self._pd_decode_peers: list[ActorHandle] = []
-        self._pd_bootstrap_host: Optional[str] = None
-
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
             self.config.load_format = "auto"
@@ -217,11 +212,6 @@ class SGLangHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
-
-    async def set_pd_peer(self, decode_peers: list, bootstrap_host: str):
-        assert isinstance(decode_peers, list) and decode_peers
-        self._pd_decode_peers = list(decode_peers)
-        self._pd_bootstrap_host = bootstrap_host
 
     def _prepend_cu12_lib_to_ld_library_path(self) -> None:
         """Ray runtime_env.pip installs cu12 into a transient venv, not the usual
@@ -534,35 +524,12 @@ class SGLangHttpServer:
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
     ) -> TokenOutput:
-        # PD top-level dispatch: prefill mints a bootstrap_room and fans out
-        # paired local-prefill + remote-decode calls; decode returns the tokens
-        # (prefill only materialises KV and pushes via NIXL). Random peer
-        # choice avoids systematic skew from heavy-tailed RL prompt lengths.
-        if self._disaggregation_role == "prefill" and self._pd_decode_peers and bootstrap_room is None:
-            room = secrets.randbits(63)
-            decode_peer = self._pd_decode_peers[secrets.randbelow(len(self._pd_decode_peers))]
-            prefill_coro = self.generate(
-                prompt_ids,
-                dict(sampling_params),
-                f"{request_id}_P",
-                image_data=image_data,
-                video_data=video_data,
-                bootstrap_host=self._pd_bootstrap_host,
-                bootstrap_port=self._disaggregation_bootstrap_port,
-                bootstrap_room=room,
-            )
-            decode_coro = decode_peer.generate.remote(
-                prompt_ids,
-                dict(sampling_params),
-                f"{request_id}_D",
-                image_data=image_data,
-                video_data=video_data,
-                bootstrap_host=self._pd_bootstrap_host,
-                bootstrap_port=self._disaggregation_bootstrap_port,
-                bootstrap_room=room,
-            )
-            _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
-            return decode_output
+        # Leaf operation only: PD request pairing (bootstrap_room minting,
+        # prefill/decode peer selection, dispatch) is owned by SGLangPDRouter,
+        # not by this server. bootstrap_host/port/room are explicit metadata
+        # injected by the router (or None for non-PD requests); this keeps
+        # leaf servers compatible with a future native sglang_router, which
+        # also selects P/D workers and injects bootstrap metadata itself.
 
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
@@ -601,9 +568,18 @@ class SGLangHttpServer:
         if prompt_logprobs is not None:
             return_logprob = True
 
+        # GenerateReqInput._determine_batch_size checks isinstance(input_ids[0], int)
+        # to decide single vs. batch mode.  A torch.Tensor's [0] element is a
+        # 0-d tensor, not an int, so it would be misclassified as a batch and
+        # trigger the "list of lists" validation.  Always convert to a plain list.
+        if hasattr(prompt_ids, "tolist"):
+            prompt_ids_list = prompt_ids.tolist()
+        else:
+            prompt_ids_list = list(prompt_ids)
+
         request = {
             "rid": request_id,
-            "input_ids": prompt_ids,
+            "input_ids": prompt_ids_list,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "image_data": image_data,
@@ -705,6 +681,15 @@ class SGLangHttpServer:
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
 
+    async def get_global_steps(self) -> Optional[int]:
+        """Query the currently loaded model weight version.
+
+        Used by the hybrid PD deployment's model-version barrier: after a
+        weight update, every P/D leaf primary must report the same target
+        ``global_steps`` before the update is considered complete.
+        """
+        return self.global_steps
+
     async def abort_all_requests(self):
         if self.node_rank != 0:
             return
@@ -757,58 +742,77 @@ class SGLangReplica(RolloutReplica):
         )
         self.server_class = ray.remote(SGLangHttpServer)
 
-    async def launch_servers(self):
-        """Launch http server in each node."""
-        assert len(self.workers) == self.world_size, (
-            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
-        )
-
-        # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
-        worker_infos = await asyncio.gather(
+    @staticmethod
+    async def _get_worker_infos(workers: list[ActorHandle]) -> list[tuple[str, str]]:
+        """Return (node_id, CUDA_VISIBLE_DEVICES) for each worker."""
+        return await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
                     lambda self: (ray.get_runtime_context().get_node_id(), os.environ[visible_devices_keyword])
                 )
-                for worker in self.workers
+                for worker in workers
             ]
         )
-        worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
-        worker_node_ids = [worker_info[0] for worker_info in worker_infos]
-        base_gpu_id = 0
-        infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
-        replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
-        if os.environ.get(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None):
-            logger.warning(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword} is set True!")
-            base_gpu_id = (0 + self.replica_rank * replica_world_size) % self.gpus_per_node
-        # create server actor in each node with node affinity and cuda visible devices
-        for node_rank in range(self.nnodes):
-            workers = self.workers[
-                node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node
-            ]
-            node_cuda_visible_devices_set = worker_cuda_visible_devices[
-                node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node
-            ]
-            node_cuda_visible_devices = ",".join(
-                map(
-                    str,
-                    sorted(
-                        set(
-                            int(device)
-                            for worker_devices_set in node_cuda_visible_devices_set
-                            for device in worker_devices_set.split(",")
-                            if device.strip()
-                        )
-                    ),
-                )
-            )
 
+    @staticmethod
+    def _merge_cuda_visible_devices(worker_cuda_visible_devices: list[str]) -> str:
+        return ",".join(
+            map(
+                str,
+                sorted(
+                    {
+                        int(device)
+                        for worker_devices_set in worker_cuda_visible_devices
+                        for device in worker_devices_set.split(",")
+                        if device.strip()
+                    }
+                ),
+            )
+        )
+
+    async def _launch_server_group(
+        self,
+        workers: list[ActorHandle],
+        base_gpu_id: int,
+        name_fn,
+        extra_kwargs: Optional[dict] = None,
+        worker_infos: Optional[list[tuple[str, str]]] = None,
+    ) -> list[ActorHandle]:
+        """Launch one ``SGLangHttpServer`` actor per node for a (possibly PD) unit.
+
+        Extracted out of :meth:`launch_servers` so PD physical units (which may
+        span multiple nodes just like a plain replica) reuse the same node
+        grouping and multi-node master-address wiring instead of maintaining a
+        second copy of this algorithm.
+
+        Args:
+            workers: worker actor handles for this replica or physical PD unit.
+            base_gpu_id: base_gpu_id forwarded to each server actor.
+            name_fn: ``(node_rank) -> str`` deterministic actor name.
+            extra_kwargs: extra kwargs forwarded to ``server_class.remote(...)`` (e.g. PD role).
+            worker_infos: pre-fetched ``(node_id, CUDA_VISIBLE_DEVICES)`` per worker; fetched if omitted.
+
+        Returns:
+            The list of launched (and already ``launch_server``-called) server actor handles,
+            one per node, in node-rank order.
+        """
+        assert len(workers) == self.nnodes * self.gpus_per_replica_node, (
+            f"worker number {len(workers)} not equal to world size {self.world_size}"
+        )
+        extra_kwargs = extra_kwargs or {}
+        if worker_infos is None:
+            worker_infos = await self._get_worker_infos(workers)
+        worker_cuda_visible_devices = [info[1] for info in worker_infos]
+        worker_node_ids = [info[0] for info in worker_infos]
+
+        servers: list[ActorHandle] = []
+        for node_rank in range(self.nnodes):
+            node_workers = workers[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
+            node_cuda_visible_devices = self._merge_cuda_visible_devices(
+                worker_cuda_visible_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
+            )
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
-            if self.is_reward_model:
-                name = f"sglang_server_reward_{self.replica_rank}_{node_rank}{self.name_suffix}"
-            elif self.is_teacher_model:
-                name = f"sglang_server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"
-            else:
-                name = f"sglang_server_{self.replica_rank}_{node_rank}{self.name_suffix}"
+            name = name_fn(node_rank)
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id,
@@ -826,24 +830,51 @@ class SGLangReplica(RolloutReplica):
                 config=self.config,
                 model_config=self.model_config,
                 rollout_mode=self.rollout_mode,
-                workers=workers,
+                workers=node_workers,
                 replica_rank=self.replica_rank,
                 node_rank=node_rank,
                 nnodes=self.nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
                 base_gpu_id=base_gpu_id,
+                **extra_kwargs,
             )
-            self.servers.append(server)
+            servers.append(server)
 
-        # launch http server in each node
         master_address, master_port = None, None
         if self.nnodes > 1:
-            master_address, master_port = await self.servers[0].get_master_address.remote()
+            master_address, master_port = await servers[0].get_master_address.remote()
         await asyncio.gather(
             *[
                 server.launch_server.remote(master_address=master_address, master_port=master_port)
-                for server in self.servers
+                for server in servers
             ]
+        )
+        return servers
+
+    async def launch_servers(self):
+        """Launch http server in each node."""
+        assert len(self.workers) == self.world_size, (
+            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
+        )
+
+        base_gpu_id = 0
+        infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
+        replica_world_size = infer_tp * self.config.pipeline_model_parallel_size
+        if os.environ.get(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}", None):
+            logger.warning(f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword} is set True!")
+            base_gpu_id = (0 + self.replica_rank * replica_world_size) % self.gpus_per_node
+
+        if self.is_reward_model:
+            name_fn = lambda node_rank: f"sglang_server_reward_{self.replica_rank}_{node_rank}{self.name_suffix}"  # noqa: E731
+        elif self.is_teacher_model:
+            name_fn = lambda node_rank: f"sglang_server_teacher_{self.replica_rank}_{node_rank}{self.name_suffix}"  # noqa: E731
+        else:
+            name_fn = lambda node_rank: f"sglang_server_{self.replica_rank}_{node_rank}{self.name_suffix}"  # noqa: E731
+
+        self.servers = await self._launch_server_group(
+            workers=self.workers,
+            base_gpu_id=base_gpu_id,
+            name_fn=name_fn,
         )
 
         # get http server address from first server

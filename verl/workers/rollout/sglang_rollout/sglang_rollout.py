@@ -131,24 +131,23 @@ class ServerAdapter(BaseRollout):
 
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
-        # PD asymmetric layout inflates per-replica footprint; must match
-        # agent_loop.py:_initialize_llm_servers or trainer-to-replica mapping breaks.
+        # Hybrid PD topology (equal P/D TP) computes rank placement once and shares
+        # it with server launch code; see pd_topology.HybridPDTopology and
+        # docs/advance/sglang_hybrid_pd_disaggregation.md.
         disagg = getattr(self.config, "disaggregation", None)
-        prefill_tp = self.config.tensor_model_parallel_size
-        if disagg is not None and getattr(disagg, "enabled", False):
-            # Inline decode_tp default: OmegaConf/Ray serialization drops dataclass methods.
-            decode_tp = (
-                disagg.decode_tensor_model_parallel_size
-                if disagg.decode_tensor_model_parallel_size is not None
-                else prefill_tp
-            )
+        pd_enabled = disagg is not None and getattr(disagg, "enabled", False)
+        tp_size = self.config.tensor_model_parallel_size
+        if pd_enabled:
+            from verl.workers.rollout.sglang_rollout.pd_topology import HybridPDTopology
+
+            # pd_world_size is independent of deployment_id (which only affects
+            # actor names), so compute it once here before replica_rank is known.
+            pd_world_size = (disagg.prefill_replicas + disagg.decode_replicas) * tp_size
             rollout_world_size = (
-                (prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas)
-                * self.config.data_parallel_size
-                * self.config.pipeline_model_parallel_size
+                pd_world_size * self.config.data_parallel_size * self.config.pipeline_model_parallel_size
             )
         else:
-            rollout_world_size = prefill_tp * self.config.data_parallel_size * self.config.pipeline_model_parallel_size
+            rollout_world_size = tp_size * self.config.data_parallel_size * self.config.pipeline_model_parallel_size
         if replica_rank == -1:
             self.replica_rank = rank // rollout_world_size
         else:
@@ -157,34 +156,31 @@ class ServerAdapter(BaseRollout):
         self.node_rank = self.rollout_rank // local_world_size
         self.local_rank = self.rollout_rank % local_world_size
 
-        # Map each trainer rank to its co-located SGLang server so weight-update
-        # IPC handles stay on the GPU where they were created. Offset math
-        # assumes prefill_replicas == 1 (enforced by SGLangPDReplica); if that
-        # ever lifts, update both this block and SGLangPDReplica.launch_servers.
-        self._pd_role = None
-        self._pd_server_index = None
-        self._pd_tp_local_rank = None
-        if disagg is not None and getattr(disagg, "enabled", False):
-            decode_tp = (
-                disagg.decode_tensor_model_parallel_size
-                if disagg.decode_tensor_model_parallel_size is not None
-                else prefill_tp
+        # Build topology with deployment_id so actor names match those chosen
+        # by SGLangHybridPDReplicaSet (which uses str(replica_rank) as the id).
+        if pd_enabled:
+            self._pd_topology = HybridPDTopology.build(
+                tp_size=tp_size,
+                prefill_replicas=disagg.prefill_replicas,
+                decode_replicas=disagg.decode_replicas,
+                deployment_id=str(self.replica_rank),
             )
-            # Modulo by single-group footprint so if DP>1 is ever enabled,
-            # each DP group's ranks resolve to the same role offsets.
-            footprint = prefill_tp + disagg.decode_replicas * decode_tp
-            local = self.rollout_rank % footprint
-            if local < prefill_tp:
-                self._pd_role = "prefill"
-                self._pd_server_index = 0
-                self._pd_tp_local_rank = local
-            else:
-                off = local - prefill_tp
-                self._pd_role = "decode"
-                self._pd_server_index = off // decode_tp
-                self._pd_tp_local_rank = off % decode_tp
-        self._has_server = (disagg is None or not getattr(disagg, "enabled", False)) or (self._pd_role is not None)
+        else:
+            self._pd_topology = None
 
+        # Map each trainer rank to its co-located SGLang server so weight-update
+        # IPC handles stay on the GPU where they were created.
+        self._pd_role = None
+        self._pd_tp_local_rank = None
+        self._pd_actor_name = None
+        if self._pd_topology is not None:
+            # Modulo by the topology's world size so if DP>1 is ever enabled,
+            # each DP group's ranks resolve to the same role offsets.
+            local = self.rollout_rank % self._pd_topology.world_size
+            placement, tp_local_rank = self._pd_topology.placement_for_global_rank(local)
+            self._pd_role = placement.role.value
+            self._pd_tp_local_rank = tp_local_rank
+            self._pd_actor_name = placement.primary_actor_name
         # sleep_level controls what gets released during sleep/release:
         #   2 (default) = release weights + kv_cache (full sleep, merge path)
         #   1 = release kv_cache only (keep base weights, adapter path)
@@ -193,9 +189,6 @@ class ServerAdapter(BaseRollout):
 
     async def _init_server_adapter(self):
         if self._engine is not None:
-            return
-
-        if not self._has_server:
             return
 
         # device_mesh is needed to gather cuda ipc handle to update weights.
@@ -218,14 +211,10 @@ class ServerAdapter(BaseRollout):
             if self.device_mesh["infer_tp"].get_local_rank() != 0:
                 return
 
-        if self._pd_role == "prefill":
-            actor_name = f"sglang_server_{self.replica_rank}_0"
-            timeout_kwargs = {}
-        elif self._pd_role == "decode":
-            actor_name = f"sglang_server_decode_{self.replica_rank}_{self._pd_server_index}"
-            # Decode init on long-prompt workloads can stall past the default
-            # (60s × 12); shorter timeout + fewer attempts avoids trainer lockup.
-            timeout_kwargs = {"timeout": 10.0, "max_attempts": 2}
+        if self._pd_actor_name is not None:
+            actor_name = self._pd_actor_name
+            # Decode init on long-prompt workloads can stall past the default.
+            timeout_kwargs = {"timeout": 10.0, "max_attempts": 2} if self._pd_role == "decode" else {}
         else:
             actor_name = f"sglang_server_{self.replica_rank}_{self.node_rank}"
             timeout_kwargs = {}
@@ -251,9 +240,7 @@ class ServerAdapter(BaseRollout):
     def _is_server_tp_leader(self) -> bool:
         """True if this rank is TP-rank-0 of its server's group.
 
-        In PD, the role's TP (prefill_tp or decode_tp) may differ from the
-        config-level TP that device_mesh was built with, so use
-        _pd_tp_local_rank when PD is active.
+        PD uses the topology's TP-local rank; non-PD uses the inference mesh.
         """
         if self._pd_role is not None:
             return self._pd_tp_local_rank == 0
