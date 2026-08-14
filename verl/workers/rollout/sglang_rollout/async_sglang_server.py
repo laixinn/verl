@@ -225,13 +225,22 @@ class SGLangHttpServer:
                 f"NIXL may fail with 'libcudart.so.12: cannot open shared object'."
             )
             return
-        cu12_lib = str(Path(cu12_mod.__file__).parent / "lib")
-        if not os.path.isdir(cu12_lib):
+        cu12_lib = next(
+            (
+                Path(package_path) / "lib"
+                for package_path in cu12_mod.__path__
+                if (Path(package_path) / "lib" / "libcudart.so.12").is_file()
+            ),
+            None,
+        )
+        if cu12_lib is None:
+            logger.warning("Could not locate libcudart.so.12 in nvidia.cuda_runtime package paths.")
             return
+        cu12_lib = str(cu12_lib)
         existing = os.environ.get("LD_LIBRARY_PATH", "")
-        if cu12_lib in existing.split(":"):
+        if cu12_lib in existing.split(os.pathsep):
             return
-        os.environ["LD_LIBRARY_PATH"] = f"{cu12_lib}:{existing}" if existing else cu12_lib
+        os.environ["LD_LIBRARY_PATH"] = f"{cu12_lib}{os.pathsep}{existing}" if existing else cu12_lib
         logger.info(f"Prepended {cu12_lib} to LD_LIBRARY_PATH for NIXL/UCX dlopen.")
 
     async def launch_server(self, master_address: str = None, master_port: int = None):
@@ -680,15 +689,6 @@ class SGLangHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
-
-    async def get_global_steps(self) -> Optional[int]:
-        """Query the currently loaded model weight version.
-
-        Used by the hybrid PD deployment's model-version barrier: after a
-        weight update, every P/D leaf primary must report the same target
-        ``global_steps`` before the update is considered complete.
-        """
-        return self.global_steps
 
     async def abort_all_requests(self):
         if self.node_rank != 0:

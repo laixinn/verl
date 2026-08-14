@@ -114,13 +114,14 @@ def _sglang_available() -> bool:
 
 @pytest.mark.skipif(not _sglang_available(), reason="sglang not installed")
 def test_dispatch_sglang_returns_pd_replica_when_flag_set():
-    from verl.workers.rollout.replica import get_rollout_replica_class
+    from verl.workers.rollout.replica import RolloutReplica, get_rollout_replica_class
 
     plain_cls = get_rollout_replica_class("sglang", disaggregation_enabled=False)
     pd_cls = get_rollout_replica_class("sglang", disaggregation_enabled=True)
     assert plain_cls.__name__ == "SGLangReplica"
-    assert pd_cls.__name__ == "SGLangPDReplica"
-    assert issubclass(pd_cls, plain_cls)
+    assert pd_cls.__name__ == "SGLangHybridPDReplicaSet"
+    assert issubclass(pd_cls, RolloutReplica)
+    assert not issubclass(pd_cls, plain_cls)
 
 
 def test_dispatch_non_pd_backend_with_flag_raises():
@@ -130,43 +131,7 @@ def test_dispatch_non_pd_backend_with_flag_raises():
         get_rollout_replica_class("trtllm", disaggregation_enabled=True)
 
 
-def _assign_pd_role(rollout_rank: int, prefill_tp: int, decode_replicas: int, decode_tp: int):
-    """Mirror of ServerAdapter.__init__'s role-assignment block."""
-    if rollout_rank < prefill_tp:
-        return "prefill", 0, rollout_rank
-    off = rollout_rank - prefill_tp
-    if off < decode_replicas * decode_tp:
-        return "decode", off // decode_tp, off % decode_tp
-    return None, None, None
-
-
-@pytest.mark.parametrize(
-    "prefill_tp,decode_replicas,decode_tp,rollout_rank,expected",
-    [
-        (1, 3, 1, 0, ("prefill", 0, 0)),
-        (1, 3, 1, 1, ("decode", 0, 0)),
-        (1, 3, 1, 2, ("decode", 1, 0)),
-        (1, 3, 1, 3, ("decode", 2, 0)),
-        (1, 7, 1, 0, ("prefill", 0, 0)),
-        (1, 7, 1, 7, ("decode", 6, 0)),
-        (2, 3, 2, 0, ("prefill", 0, 0)),
-        (2, 3, 2, 1, ("prefill", 0, 1)),
-        (2, 3, 2, 2, ("decode", 0, 0)),
-        (2, 3, 2, 3, ("decode", 0, 1)),
-        (2, 3, 2, 6, ("decode", 2, 0)),
-        (2, 3, 2, 7, ("decode", 2, 1)),
-    ],
-)
-def test_pd_role_assignment(prefill_tp, decode_replicas, decode_tp, rollout_rank, expected):
-    assert _assign_pd_role(rollout_rank, prefill_tp, decode_replicas, decode_tp) == expected
-
-
-@pytest.mark.parametrize("prefill_tp,decode_replicas,decode_tp", [(1, 3, 1), (1, 7, 1), (2, 3, 2), (1, 1, 4)])
-def test_pd_role_covers_every_rank_exactly_once(prefill_tp, decode_replicas, decode_tp):
-    world = prefill_tp + decode_replicas * decode_tp
-    seen: set[tuple[str, int, int]] = set()
-    for rr in range(world):
-        role, srv, tp_rank = _assign_pd_role(rr, prefill_tp, decode_replicas, decode_tp)
-        assert role is not None, f"rollout_rank={rr} got no role"
-        seen.add((role, srv, tp_rank))
-    assert len(seen) == world, "each rank must map to a distinct (role, server_index, tp_local_rank) triple"
+# NOTE: rank→(role, replica, tp_local_rank) mapping is covered directly against the
+# real implementation via HybridPDTopology.placement_for_global_rank in
+# test_sglang_pd_topology_on_cpu.py (including multi-prefill topologies), which
+# replaced the former hand-written mirror of ServerAdapter's assignment block.

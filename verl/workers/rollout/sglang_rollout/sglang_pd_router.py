@@ -181,10 +181,6 @@ class RayPDRouterController:
             ray.kill(self._actor)
             self._actor = None
 
-    @property
-    def actor_handle(self) -> Optional[ActorHandle]:
-        return self._actor
-
 
 class PDRouterFactory:
     """Build the configured router controller."""

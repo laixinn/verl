@@ -22,7 +22,10 @@ design doc's "Mocked launch tests" test plan section.
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Optional
 from unittest.mock import patch
 
@@ -476,6 +479,36 @@ async def test_launch_failure_before_router_creation_does_not_touch_router():
 
     assert replica_set.router is None
     fake_factory.create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# CUDA runtime library discovery
+# ---------------------------------------------------------------------------
+
+
+def test_cu12_runtime_namespace_package_prepends_library_path(monkeypatch, tmp_path):
+    """The CUDA runtime wheel is an implicit namespace package with no ``__file__``."""
+    from verl.workers.rollout.sglang_rollout import async_sglang_server as server_mod
+
+    missing_package_path = tmp_path / "missing"
+    runtime_package_path = tmp_path / "cuda_runtime"
+    runtime_lib = runtime_package_path / "lib"
+    runtime_lib.mkdir(parents=True)
+    (runtime_lib / "libcudart.so.12").touch()
+
+    fake_cuda_runtime = ModuleType("nvidia.cuda_runtime")
+    fake_cuda_runtime.__file__ = None
+    fake_cuda_runtime.__path__ = [str(missing_package_path), str(runtime_package_path)]
+    monkeypatch.setitem(sys.modules, "nvidia.cuda_runtime", fake_cuda_runtime)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/existing")
+
+    server = object.__new__(server_mod.SGLangHttpServer)
+    server._prepend_cu12_lib_to_ld_library_path()
+    expected = f"{runtime_lib}{os.pathsep}/existing"
+    assert os.environ["LD_LIBRARY_PATH"] == expected
+
+    server._prepend_cu12_lib_to_ld_library_path()
+    assert os.environ["LD_LIBRARY_PATH"] == expected
 
 
 # ---------------------------------------------------------------------------
