@@ -27,6 +27,7 @@ Implements the design in ``docs/advance/sglang_hybrid_pd_disaggregation.md``:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import suppress
@@ -316,19 +317,36 @@ class SGLangHybridPDReplicaSet(RolloutReplica):
             # 4. Reserve a unique bootstrap socket on each prefill primary node.
             for prefill, unit_workers in prefill_pairs:
                 prefill.workers = unit_workers
-                await prefill.reserve_bootstrap_port()
+            await asyncio.gather(
+                *(prefill.reserve_bootstrap_port() for prefill, _ in prefill_pairs)
+            )
 
             # 5. Launch prefill leaf servers. Release the reservation immediately
             # before SGLang binds the bootstrap port.
-            for prefill, unit_workers in prefill_pairs:
+            async def _launch_prefill(prefill, unit_workers):
                 await prefill.close_bootstrap_reservation()
                 await prefill.init_hybrid_workers(unit_workers, prefill.placement)
-                launched_prefills.append(prefill)
+                return prefill
 
             # 6. Launch decode leaf servers.
-            for decode, unit_workers in decode_pairs:
+            async def _launch_decode(decode, unit_workers):
                 await decode.init_hybrid_workers(unit_workers, decode.placement)
-                launched_decodes.append(decode)
+                return decode
+
+            launched_prefills, launched_decodes = await asyncio.gather(
+                asyncio.gather(
+                    *(
+                        _launch_prefill(prefill, unit_workers)
+                        for prefill, unit_workers in prefill_pairs
+                    )
+                ),
+                asyncio.gather(
+                    *(
+                        _launch_decode(decode, unit_workers)
+                        for decode, unit_workers in decode_pairs
+                    )
+                ),
+            )
 
             self.prefills = launched_prefills
             self.decodes = launched_decodes
@@ -355,7 +373,7 @@ class SGLangHybridPDReplicaSet(RolloutReplica):
             for replica, _ in prefill_pairs + decode_pairs:
                 with suppress(Exception):
                     await replica.close_bootstrap_reservation()
-                for server in replica.servers:
+                for server in getattr(replica, "servers", []):
                     with suppress(Exception):
                         ray.kill(server)
             raise
