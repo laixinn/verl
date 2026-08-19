@@ -57,6 +57,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 visible_devices_keyword = get_visible_devices_keyword()
+ib_devices_keyword = "VERL_EXPERIMENT_NV_IB_DEVICES"
 
 
 def _extract_prompt_logprobs_sglang(
@@ -137,18 +138,22 @@ class SGLangHttpServer:
         base_gpu_id: int,
         disaggregation_role: str = "null",
         disaggregation_bootstrap_port: Optional[int] = None,
+        disaggregation_ib_device: Optional[str] = None,
     ):
         print(
             f"SGLang http server: {rollout_mode=}, {replica_rank=}, {node_rank=}, "
             f"{nnodes=}, {cuda_visible_devices=}, role={disaggregation_role}"
         )
         os.environ[visible_devices_keyword] = cuda_visible_devices
+        if disaggregation_ib_device is not None:
+            os.environ[ib_devices_keyword] = disaggregation_ib_device
 
         assert disaggregation_role in ("null", "prefill", "decode"), (
             f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}"
         )
         self._disaggregation_role = disaggregation_role
         self._disaggregation_bootstrap_port = disaggregation_bootstrap_port
+        self._disaggregation_ib_device = disaggregation_ib_device
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
@@ -377,8 +382,8 @@ class SGLangHttpServer:
                 args["disaggregation_bootstrap_port"] = self._disaggregation_bootstrap_port
             if disagg.decode_tensor_model_parallel_size is not None:
                 args["disaggregation_decode_tp"] = disagg.decode_tensor_model_parallel_size
-            if disagg.ib_device is not None:
-                args["disaggregation_ib_device"] = disagg.ib_device
+            if self._disaggregation_ib_device:
+                args["disaggregation_ib_device"] = self._disaggregation_ib_device
 
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
@@ -743,12 +748,16 @@ class SGLangReplica(RolloutReplica):
         self.server_class = ray.remote(SGLangHttpServer)
 
     @staticmethod
-    async def _get_worker_infos(workers: list[ActorHandle]) -> list[tuple[str, str]]:
-        """Return (node_id, CUDA_VISIBLE_DEVICES) for each worker."""
+    async def _get_worker_infos(workers: list[ActorHandle]) -> list[tuple[str, str, str]]:
+        """Return (node_id, CUDA_VISIBLE_DEVICES, IB_DEVICES) for each worker."""
         return await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
-                    lambda self: (ray.get_runtime_context().get_node_id(), os.environ[visible_devices_keyword])
+                    lambda self: (
+                        ray.get_runtime_context().get_node_id(),
+                        os.environ[visible_devices_keyword],
+                        os.environ.get(ib_devices_keyword, ""),
+                    )
                 )
                 for worker in workers
             ]
@@ -770,13 +779,31 @@ class SGLangReplica(RolloutReplica):
             )
         )
 
+    @staticmethod
+    def _merge_ib_devices(worker_ib_devices: list[str]) -> str:
+        """Merge per-worker IB device lists into a deduplicated, order-preserving string.
+
+        IB device names are strings like ``mlx5_0``, ``roce1``, etc. -- they
+        cannot be cast to ``int`` like GPU indices, so we simply collect unique
+        non-empty entries in first-seen order.
+        """
+        seen: set[str] = set()
+        merged: list[str] = []
+        for worker_devices in worker_ib_devices:
+            for device in worker_devices.split(","):
+                device = device.strip()
+                if device and device not in seen:
+                    seen.add(device)
+                    merged.append(device)
+        return ",".join(merged)
+
     async def _launch_server_group(
         self,
         workers: list[ActorHandle],
         base_gpu_id: int,
         name_fn,
         extra_kwargs: Optional[dict] = None,
-        worker_infos: Optional[list[tuple[str, str]]] = None,
+        worker_infos: Optional[list[tuple[str, str, str]]] = None,
     ) -> list[ActorHandle]:
         """Launch one ``SGLangHttpServer`` actor per node for a (possibly PD) unit.
 
@@ -790,7 +817,7 @@ class SGLangReplica(RolloutReplica):
             base_gpu_id: base_gpu_id forwarded to each server actor.
             name_fn: ``(node_rank) -> str`` deterministic actor name.
             extra_kwargs: extra kwargs forwarded to ``server_class.remote(...)`` (e.g. PD role).
-            worker_infos: pre-fetched ``(node_id, CUDA_VISIBLE_DEVICES)`` per worker; fetched if omitted.
+            worker_infos: pre-fetched ``(node_id, CUDA_VISIBLE_DEVICES, IB_DEVICES)`` per worker; fetched if omitted.
 
         Returns:
             The list of launched (and already ``launch_server``-called) server actor handles,
@@ -804,12 +831,17 @@ class SGLangReplica(RolloutReplica):
             worker_infos = await self._get_worker_infos(workers)
         worker_cuda_visible_devices = [info[1] for info in worker_infos]
         worker_node_ids = [info[0] for info in worker_infos]
+        worker_ib_devices = [info[2] for info in worker_infos]
 
         servers: list[ActorHandle] = []
         for node_rank in range(self.nnodes):
+            # TODO: support cross-node replica
             node_workers = workers[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
             node_cuda_visible_devices = self._merge_cuda_visible_devices(
                 worker_cuda_visible_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
+            )
+            node_ib_devices = self._merge_ib_devices(
+                worker_ib_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
             )
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
             name = name_fn(node_rank)
@@ -836,6 +868,7 @@ class SGLangReplica(RolloutReplica):
                 nnodes=self.nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
                 base_gpu_id=base_gpu_id,
+                disaggregation_ib_device=node_ib_devices,
                 **extra_kwargs,
             )
             servers.append(server)
