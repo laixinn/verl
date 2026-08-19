@@ -511,8 +511,8 @@ class LLMServerManager:
             * self.rollout_config.data_parallel_size
             * self.rollout_config.pipeline_model_parallel_size
         )
-        # PD inflates per-replica footprint; miss this and init_hybrid slices past
-        # worker_group -> empty workers on replica_rank>=1.
+        # PD inflates per-replica footprint; miss this and init_hybrid slices
+        # past worker_group → empty workers on replica_rank>=1.
         disagg = getattr(self.rollout_config, "disaggregation", None)
         if disagg is not None and getattr(disagg, "enabled", False):
             prefill_tp = self.rollout_config.tensor_model_parallel_size
@@ -523,7 +523,7 @@ class LLMServerManager:
                 else prefill_tp
             )
             rollout_world_size = (
-                prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas
+                (prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas)
                 * self.rollout_config.data_parallel_size
                 * self.rollout_config.pipeline_model_parallel_size
             )
