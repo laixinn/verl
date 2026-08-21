@@ -840,9 +840,10 @@ class SGLangReplica(RolloutReplica):
             node_cuda_visible_devices = self._merge_cuda_visible_devices(
                 worker_cuda_visible_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
             )
-            node_ib_devices = self._merge_ib_devices(
-                worker_ib_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
-            )
+            if extra_kwargs.get("disaggregation_role", "null") != "null":
+                extra_kwargs["disaggregation_ib_device"] = self._merge_ib_devices(
+                    worker_ib_devices[node_rank * self.gpus_per_replica_node : (node_rank + 1) * self.gpus_per_replica_node]
+                )
             node_id = worker_node_ids[node_rank * self.gpus_per_replica_node]
             name = name_fn(node_rank)
             server = self.server_class.options(
@@ -868,7 +869,6 @@ class SGLangReplica(RolloutReplica):
                 nnodes=self.nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
                 base_gpu_id=base_gpu_id,
-                disaggregation_ib_device=node_ib_devices,
                 **extra_kwargs,
             )
             servers.append(server)
