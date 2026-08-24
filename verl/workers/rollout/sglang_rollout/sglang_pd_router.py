@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from contextlib import suppress
 from dataclasses import dataclass
@@ -25,8 +26,10 @@ import ray
 from ray.actor import ActorHandle
 
 from verl.workers.config.disaggregation import PDRouterConfig
-from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.sglang_rollout.pd_topology import DisaggregationRole
+
+logger = logging.getLogger(__file__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +61,7 @@ class RolloutEndpoint:
 
 
 class PDRouterController(Protocol):
-    """Control-plane contract shared by current and future router backends."""
+    """Control-plane contract for the hybrid PD router."""
 
     async def start(
         self,
@@ -67,6 +70,16 @@ class PDRouterController(Protocol):
     ) -> RolloutEndpoint: ...
 
     async def stop(self) -> None: ...
+
+
+class StandalonePDRouterController(PDRouterController, Protocol):
+    """Additional admission controls owned only by the standalone PD router."""
+
+    async def quiesce(self) -> None: ...
+
+    async def resume(self) -> None: ...
+
+    async def wait_idle(self) -> None: ...
 
 
 class SGLangPDRouter:
@@ -117,6 +130,9 @@ class SGLangPDRouter:
         return self._backends[role][replica_id]
 
     def _acquire_pair(self, request_id: str) -> tuple[PDReplicaRuntime, PDReplicaRuntime]:
+        if request_id in self._pairs:
+            raise RuntimeError(f"request_id {request_id!r} is already active")
+
         prefill = self._select(DisaggregationRole.PREFILL, self.config.prefill_policy)
         decode = self._select(DisaggregationRole.DECODE, self.config.decode_policy)
         prefill_id = prefill.endpoint.replica_id
@@ -150,20 +166,69 @@ class SGLangPDRouter:
         try:
             _, decode_output = await asyncio.gather(*refs)
             return decode_output
-        except Exception:
+        except BaseException:
             for ref in refs:
                 with suppress(Exception):
                     ray.cancel(ref, force=False)
+            await asyncio.gather(*refs, return_exceptions=True)
             raise
         finally:
             self._release_pair(request_id)
 
 
-class RayPDRouterController:
-    """Controller for a Ray-hosted :class:`SGLangPDRouter`."""
+class SGLangStandalonePDRouter(SGLangPDRouter):
+    """Standalone router with admission control and in-flight drain tracking."""
 
     def __init__(self, config: PDRouterConfig):
+        super().__init__(config)
+        self._admission_open = asyncio.Event()
+        self._admission_open.set()
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    async def generate(self, request_id: str, **request: Any) -> TokenOutput:
+        """Wait for temporary weight synchronization to finish before admitting new work."""
+        await self._admission_open.wait()
+        return await super().generate(request_id, **request)
+
+    def _acquire_pair(self, request_id: str) -> tuple[PDReplicaRuntime, PDReplicaRuntime]:
+        pair = super()._acquire_pair(request_id)
+        self._idle.clear()
+        return pair
+
+    def _release_pair(self, request_id: str) -> None:
+        super()._release_pair(request_id)
+        if not self._pairs:
+            self._idle.set()
+
+    async def quiesce(self) -> None:
+        self._admission_open.clear()
+
+    async def resume(self) -> None:
+        self._admission_open.set()
+
+    async def wait_idle(self, timeout_s: float = 10.0) -> None:
+        if self._idle.is_set():
+            return
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=timeout_s)
+        except TimeoutError:
+            logger.warning(
+                "Standalone PD router did not drain %d active request pairs within %.1f seconds",
+                len(self._pairs),
+                timeout_s,
+            )
+            raise
+
+
+class RayPDRouterController:
+    """Controller for a Ray-hosted hybrid :class:`SGLangPDRouter`."""
+
+    router_cls = SGLangPDRouter
+
+    def __init__(self, config: PDRouterConfig, router_id: str):
         self.config = config
+        self.router_id = router_id
         self._actor: Optional[ActorHandle] = None
 
     async def start(
@@ -172,9 +237,13 @@ class RayPDRouterController:
         decodes: list[PDReplicaRuntime],
     ) -> RolloutEndpoint:
         if self._actor is None:
-            self._actor = ray.remote(SGLangPDRouter).options(max_concurrency=10000).remote(self.config)
+            self._actor = (
+                ray.remote(self.router_cls)
+                .options(name=self.router_id, max_concurrency=10000)
+                .remote(self.config)
+            )
         await self._actor.register_backends.remote(prefills, decodes)
-        return RolloutEndpoint(endpoint_id="sglang_pd_router", actor_handle=self._actor)
+        return RolloutEndpoint(endpoint_id=self.router_id, actor_handle=self._actor)
 
     async def stop(self) -> None:
         if self._actor is not None:
@@ -182,13 +251,42 @@ class RayPDRouterController:
             self._actor = None
 
 
+class RayStandalonePDRouterController(RayPDRouterController):
+    """Controller for a Ray-hosted standalone :class:`SGLangStandalonePDRouter`."""
+
+    router_cls = SGLangStandalonePDRouter
+
+    def _require_actor(self) -> ActorHandle:
+        if self._actor is None:
+            raise RuntimeError("standalone PD router has not been started")
+        return self._actor
+
+    async def quiesce(self) -> None:
+        await self._require_actor().quiesce.remote()
+
+    async def resume(self) -> None:
+        await self._require_actor().resume.remote()
+
+    async def wait_idle(self, timeout_s: float = 10.0) -> None:
+        await self._require_actor().wait_idle.remote(timeout_s)
+
+
 class PDRouterFactory:
     """Build the configured router controller."""
 
     @staticmethod
-    def create(config: PDRouterConfig) -> PDRouterController:
+    def create(
+        config: PDRouterConfig,
+        rollout_mode: RolloutMode,
+        deployment_id: str,
+    ) -> PDRouterController | StandalonePDRouterController:
         if config.backend == "ray":
-            return RayPDRouterController(config)
+            router_id = f"sglang_pd_router_{rollout_mode.value}_{deployment_id}"
+            if rollout_mode == RolloutMode.HYBRID:
+                return RayPDRouterController(config, router_id)
+            if rollout_mode == RolloutMode.STANDALONE:
+                return RayStandalonePDRouterController(config, router_id)
+            raise ValueError(f"Unsupported PD router rollout mode: {rollout_mode!r}")
         if config.backend == "sglang":
             raise NotImplementedError(
                 "Native sglang_router integration is not implemented yet; "

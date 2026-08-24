@@ -37,8 +37,8 @@ import ray
 from omegaconf import DictConfig
 from ray.actor import ActorHandle
 
-from verl.single_controller.ray import RayWorkerGroup
-from verl.utils.device import get_visible_devices_keyword, is_torch_npu_available
+from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+from verl.utils.device import get_device_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.workers.config import RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica
@@ -125,6 +125,17 @@ class SGLangPDReplica(SGLangReplica):
         )
         assert placement == self.placement
         self.rollout_mode = RolloutMode.HYBRID
+        self.workers = workers
+        await self.launch_servers()
+
+    async def init_standalone_workers(self, workers: list[ActorHandle], placement: PDUnitPlacement) -> None:
+        """Init this physical unit with standalone workers owned by the composite PD replica."""
+        assert len(workers) == self.world_size, (
+            f"physical PD unit {placement.unit_rank} ({placement.role.value}) needs "
+            f"{self.world_size} workers, got {len(workers)}"
+        )
+        assert placement == self.placement
+        self.rollout_mode = RolloutMode.STANDALONE
         self.workers = workers
         await self.launch_servers()
 
@@ -237,7 +248,7 @@ class SGLangDecodeReplica(SGLangPDReplica):
     role = DisaggregationRole.DECODE
 
 
-class SGLangHybridPDReplicaSet(RolloutReplica):
+class SGLangPDReplicaSet(RolloutReplica):
     """Composite hybrid PD deployment consumed by ``LLMServerManager`` / ``CheckpointEngineManager``.
 
     Owns worker placement and launches every physical P/D leaf. The Ray router
@@ -278,6 +289,8 @@ class SGLangHybridPDReplicaSet(RolloutReplica):
             deployment_id=str(replica_rank),
         )
         self.world_size = self.topology.world_size
+        self.gpus_per_replica_node = min(self.gpus_per_node, self.world_size)
+        self.nnodes = (self.world_size + self.gpus_per_replica_node - 1) // self.gpus_per_replica_node
 
         self.prefills: list[SGLangPrefillReplica] = []
         self.decodes: list[SGLangDecodeReplica] = []
@@ -355,7 +368,11 @@ class SGLangHybridPDReplicaSet(RolloutReplica):
 
             # 7-10. Register every leaf with the router and expose only that
             # logical endpoint to LLMServerManager.
-            self.router = PDRouterFactory.create(self.config.disaggregation.router)
+            self.router = PDRouterFactory.create(
+                self.config.disaggregation.router,
+                rollout_mode=self.rollout_mode,
+                deployment_id=self.topology.deployment_id,
+            )
             endpoint = await self.router.start(
                 [replica.get_runtime() for replica in self.prefills],
                 [replica.get_runtime() for replica in self.decodes],
@@ -378,5 +395,196 @@ class SGLangHybridPDReplicaSet(RolloutReplica):
                         ray.kill(server)
             raise
 
+    async def init_standalone(self) -> None:
+        """Allocate a complete standalone PD topology and launch all physical leaves."""
+        if self.config.checkpoint_engine.backend == "naive":
+            raise NotImplementedError(
+                "Standalone SGLang PD does not support checkpoint_engine.backend='naive'; "
+                "use a distributed checkpoint backend such as 'nccl' or 'mooncake'."
+            )
+
+        if self.world_size % self.gpus_per_replica_node != 0:
+            raise ValueError(
+                f"standalone PD world_size {self.world_size} must be divisible by "
+                f"gpus_per_replica_node {self.gpus_per_replica_node}"
+            )
+
+        self.rollout_mode = RolloutMode.STANDALONE
+        if self.is_reward_model:
+            resource_pool_name = f"rollout_pool_reward_pd_{self.replica_rank}{self.name_suffix}"
+            name_prefix = f"rollout_reward_standalone_pd_{self.replica_rank}{self.name_suffix}"
+        elif self.is_teacher_model:
+            resource_pool_name = f"rollout_pool_teacher_pd_{self.replica_rank}{self.name_suffix}"
+            name_prefix = f"rollout_teacher_standalone_pd_{self.replica_rank}{self.name_suffix}"
+        else:
+            resource_pool_name = f"rollout_pool_pd_{self.replica_rank}{self.name_suffix}"
+            name_prefix = f"rollout_standalone_pd_{self.replica_rank}{self.name_suffix}"
+
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec={resource_pool_name: [self.gpus_per_replica_node] * self.nnodes},
+            mapping=None,
+            max_colocate_count=2,
+        )
+        resource_pool_manager.create_resource_pool()
+        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+
+        worker_group = None
+        prefill_pairs = []
+        decode_pairs = []
+        try:
+            worker_group = RayWorkerGroup(
+                resource_pool=self.resource_pool,
+                ray_cls_with_init=self.get_ray_class_with_init_args(),
+                bin_pack=False,
+                name_prefix=name_prefix,
+                use_gpu=True,
+                device_name=get_device_name(),
+            )
+            if worker_group.world_size != self.world_size:
+                raise RuntimeError(
+                    f"standalone PD worker group has world_size={worker_group.world_size}, "
+                    f"expected {self.world_size}"
+                )
+            self._standalone_worker_group = worker_group
+            standalone_workers = worker_group.workers
+
+            def build_units(replica_cls, units):
+                return [
+                    (
+                        replica_cls(
+                            placement=unit,
+                            config=self.config,
+                            model_config=self.model_config,
+                            gpus_per_node=self.gpus_per_node,
+                        ),
+                        standalone_workers[unit.begin_rank : unit.begin_rank + unit.tp_size],
+                    )
+                    for unit in units
+                ]
+
+            prefill_pairs = build_units(SGLangPrefillReplica, self.topology.prefill_units)
+            decode_pairs = build_units(SGLangDecodeReplica, self.topology.decode_units)
+
+            for prefill, unit_workers in prefill_pairs:
+                prefill.workers = unit_workers
+            await asyncio.gather(*(prefill.reserve_bootstrap_port() for prefill, _ in prefill_pairs))
+
+            async def _launch_prefill(prefill, unit_workers):
+                await prefill.close_bootstrap_reservation()
+                await prefill.init_standalone_workers(unit_workers, prefill.placement)
+                return prefill
+
+            async def _launch_decode(decode, unit_workers):
+                await decode.init_standalone_workers(unit_workers, decode.placement)
+                return decode
+
+            launched_prefills, launched_decodes = await asyncio.gather(
+                asyncio.gather(*(_launch_prefill(prefill, workers) for prefill, workers in prefill_pairs)),
+                asyncio.gather(*(_launch_decode(decode, workers) for decode, workers in decode_pairs)),
+            )
+
+            self.prefills = list(launched_prefills)
+            self.decodes = list(launched_decodes)
+            self.workers = [worker for replica in self.prefills + self.decodes for worker in replica.workers]
+            self.servers = [server for replica in self.prefills + self.decodes for server in replica.servers]
+
+            self.router = PDRouterFactory.create(
+                self.config.disaggregation.router,
+                rollout_mode=self.rollout_mode,
+                deployment_id=self.topology.deployment_id,
+            )
+            endpoint = await self.router.start(
+                [replica.get_runtime() for replica in self.prefills],
+                [replica.get_runtime() for replica in self.decodes],
+            )
+            self._server_handle = endpoint.actor_handle
+            self._server_address = endpoint.http_url or endpoint.endpoint_id
+        except Exception:
+            logger.exception(
+                "SGLangPDReplicaSet replica_rank=%s init_standalone failed; tearing down partial topology",
+                self.replica_rank,
+            )
+            if self.router is not None:
+                with suppress(Exception):
+                    await self.router.stop()
+            for replica, _ in prefill_pairs + decode_pairs:
+                with suppress(Exception):
+                    await replica.close_bootstrap_reservation()
+                for server in getattr(replica, "servers", []):
+                    with suppress(Exception):
+                        ray.kill(server)
+            for worker in getattr(worker_group, "workers", []):
+                with suppress(Exception):
+                    ray.kill(worker)
+            for placement_group in getattr(self.resource_pool, "pgs", None) or []:
+                with suppress(Exception):
+                    ray.util.remove_placement_group(placement_group)
+            raise
+
+    async def abort_all_requests(self) -> None:
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            await super().abort_all_requests()
+            return
+
+        await self.router.quiesce()
+        await asyncio.gather(*(replica.abort_all_requests() for replica in self.prefills + self.decodes))
+        await self.router.wait_idle()
+
+    async def resume_generation(self) -> None:
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            await super().resume_generation()
+            return
+
+        await asyncio.gather(*(replica.resume_generation() for replica in self.prefills + self.decodes))
+        await self.router.resume()
+
+    async def shutdown(self) -> None:
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            raise RuntimeError("SGLangPDReplicaSet.shutdown() only owns resources in standalone mode")
+
+        if self.router is not None:
+            await self.router.quiesce()
+
+        await asyncio.gather(
+            *(replica.abort_all_requests() for replica in self.prefills + self.decodes),
+            return_exceptions=True,
+        )
+
+        if self.router is not None:
+            await self.router.wait_idle()
+            with suppress(Exception):
+                await self.router.stop()
+            self.router = None
+
+        for replica in self.prefills + self.decodes:
+            with suppress(Exception):
+                await replica.close_bootstrap_reservation()
+            for server in replica.servers:
+                with suppress(Exception):
+                    ray.kill(server)
+            replica.servers = []
+            replica._server_handle = None
+            replica._server_address = None
+            replica.workers = []
+
+        for worker in self.workers:
+            with suppress(Exception):
+                ray.kill(worker)
+
+        for placement_group in getattr(self.resource_pool, "pgs", None) or []:
+            with suppress(Exception):
+                ray.util.remove_placement_group(placement_group)
+
+        self.prefills = []
+        self.decodes = []
+        self.workers = []
+        self.servers = []
+        self.resource_pool = None
+        self._standalone_worker_group = None
+        self._server_handle = None
+        self._server_address = None
+
     async def launch_servers(self):
-        raise NotImplementedError("SGLangHybridPDReplicaSet is initialized via init_hybrid(), not launch_servers()")
+        raise NotImplementedError(
+            "SGLangPDReplicaSet is initialized via init_hybrid() or init_standalone(), not launch_servers()"
+        )

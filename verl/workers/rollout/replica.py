@@ -395,9 +395,9 @@ def get_rollout_replica_class(rollout: str, disaggregation_enabled: bool = False
             # _load_sglang side-effect: installs vllm mocks needed by
             # SGLangHybridPDReplicaSet's transitive imports. Cheap if already installed.
             RolloutReplicaRegistry.get("sglang")
-            from verl.workers.rollout.sglang_rollout.sglang_pd_replica import SGLangHybridPDReplicaSet
+            from verl.workers.rollout.sglang_rollout.sglang_pd_replica import SGLangPDReplicaSet
 
-            return SGLangHybridPDReplicaSet
+            return SGLangPDReplicaSet
         if rollout == "vllm":
             from verl.workers.rollout.vllm_rollout.vllm_pd_replica import vLLMPDReplica
 
