@@ -60,7 +60,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         self.rollout_dtype = rollout_dtype
         self.is_master = is_master
         self.rebuild_group = rebuild_group
-        self._live_socket = None
+        self._socket = None
 
         rank = int(os.environ["RANK"])
         device_count = get_torch_device().device_count()
@@ -93,14 +93,23 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         assert ret == 0, f"batch_register_memory failed ret={ret}"
         logger.info(f"__init__ session_id={self.session_id}")
 
+    def _close_socket(self):
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+
     def prepare(self) -> dict[str, Any]:
         """Prepare send and recv buckets"""
-        logger.info(
-            f"prepare ptr={self.buf.data_ptr():#x} len={2 * self.bucket_size} "
-            f"magic_buf_ptr={self.magic_buf.data_ptr():#x}"
-        )
-        port, self._live_socket = get_free_port(self.hostname, with_alive_sock=self.is_master)
-        return {"addr": self.hostname, "port": port}
+        self._close_socket()
+        if self.is_master:
+            logger.info(
+                f"prepare ptr={self.buf.data_ptr():#x} len={2 * self.bucket_size} "
+                f"magic_buf_ptr={self.magic_buf.data_ptr():#x}"
+            )
+            port, self._socket = get_free_port(self.hostname, with_alive_sock=True)
+            return {"addr": self.hostname, "port": port}
+        else:
+            return {}
 
     @classmethod
     def build_topology(cls, actor_wg_world_size: int, rollout_world_size: int, metadatas: list[dict]):
@@ -123,9 +132,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
             logger.info(f"init_process_group rank={rank}")
             return
         
-        if self._live_socket is not None:
-            self._live_socket.close()
-            self._live_socket = None
+        self._close_socket()
 
         self.store = StatelessProcessGroup.create(
             host=metadata["addr"],
@@ -147,6 +154,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
     def finalize(self):
         """Cleanup communication and deregister memory"""
         self.store = None
+        self._close_socket()
         get_torch_device().empty_cache()
         gc.collect()
         logger.info(f"finalize rank={self.rank}")
