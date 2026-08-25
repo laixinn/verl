@@ -527,7 +527,7 @@ class SGLangPDReplicaSet(RolloutReplica):
             return
 
         await self.router.quiesce()
-        await asyncio.gather(*(replica.abort_all_requests() for replica in self.prefills + self.decodes))
+        await asyncio.gather(*(replica.abort_all_requests() for replica in self.decodes))
         await self.router.wait_idle()
 
     async def resume_generation(self) -> None:
@@ -546,7 +546,7 @@ class SGLangPDReplicaSet(RolloutReplica):
             await self.router.quiesce()
 
         await asyncio.gather(
-            *(replica.abort_all_requests() for replica in self.prefills + self.decodes),
+            *(replica.abort_all_requests() for replica in self.decodes),
             return_exceptions=True,
         )
 
