@@ -60,6 +60,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         self.rollout_dtype = rollout_dtype
         self.is_master = is_master
         self.rebuild_group = rebuild_group
+        self._live_socket = None
 
         rank = int(os.environ["RANK"])
         device_count = get_torch_device().device_count()
@@ -98,7 +99,7 @@ class MooncakeCheckpointEngine(CheckpointEngine):
             f"prepare ptr={self.buf.data_ptr():#x} len={2 * self.bucket_size} "
             f"magic_buf_ptr={self.magic_buf.data_ptr():#x}"
         )
-        port, _ = get_free_port(self.hostname)
+        port, self._live_socket = get_free_port(self.hostname, with_alive_sock=self.is_master)
         return {"addr": self.hostname, "port": port}
 
     @classmethod
@@ -121,6 +122,10 @@ class MooncakeCheckpointEngine(CheckpointEngine):
         if rank < 0:
             logger.info(f"init_process_group rank={rank}")
             return
+        
+        if self._live_socket is not None:
+            self._live_socket.close()
+            self._live_socket = None
 
         self.store = StatelessProcessGroup.create(
             host=metadata["addr"],
